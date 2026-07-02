@@ -221,7 +221,19 @@ jobs:
 
       # xtask runs on the HIL runners as a host tool.
       # We build the actual tests using the correct toolchain before.
+      # Cache the cross-compiled binaries, they rarely change so this
+      # avoids the expensive cross build.
+      - name: Cache xtask binaries
+        id: xtask-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/armv7-unknown-linux-gnueabihf/release/xtask
+            target/aarch64-unknown-linux-gnu/release/xtask
+          key: xtask-hil-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'xtask/**', 'esp-metadata/**', 'xtask-mcp-macros/**') }}
+
       - name: Install host toolchain for cross-compiling xtask
+        if: steps.xtask-cache.outputs.cache-hit != 'true'
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
@@ -229,10 +241,12 @@ jobs:
           rustup target add armv7-unknown-linux-gnueabihf
 
       - uses: taiki-e/install-action@v2
+        if: steps.xtask-cache.outputs.cache-hit != 'true'
         with:
           tool: cross
 
       - name: Build xtask for HIL runners
+        if: steps.xtask-cache.outputs.cache-hit != 'true'
         run: |
           cross build --release --target armv7-unknown-linux-gnueabihf -p xtask
           cross build --release --target aarch64-unknown-linux-gnu -p xtask
@@ -343,6 +357,40 @@ jobs:
           else
             echo "value=" >> $GITHUB_OUTPUT
           fi
+
+      - name: Reset ESP USB-JTAG devices
+        if: steps.guard.outputs.skip != 'true'
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          # The support firmware runs forever on the harness probe; a previous
+          # run can leave the in-chip USB-Serial-JTAG bridge wedged so the next
+          # flash hangs. Issue USBDEVFS_RESET to force a clean re-enumeration.
+          python3 - <<'PY'
+          import fcntl, glob, os, time
+          USBDEVFS_RESET = (ord('U') << 8) | 20  # _IO('U', 20)
+          reset_any = False
+          for dev in glob.glob('/sys/bus/usb/devices/*'):
+              try:
+                  vid = open(os.path.join(dev, 'idVendor')).read().strip().lower()
+                  pid = open(os.path.join(dev, 'idProduct')).read().strip().lower()
+              except OSError:
+                  continue
+              if (vid, pid) != ('303a', '1001'):
+                  continue
+              busnum = int(open(os.path.join(dev, 'busnum')).read())
+              devnum = int(open(os.path.join(dev, 'devnum')).read())
+              node = f'/dev/bus/usb/{busnum:03d}/{devnum:03d}'
+              try:
+                  with open(node, 'wb') as f:
+                      fcntl.ioctl(f, USBDEVFS_RESET, 0)
+                  print(f'reset {node} ({vid}:{pid})')
+                  reset_any = True
+              except OSError as e:
+                  print(f'failed to reset {node}: {e}')
+          if reset_any:
+              time.sleep(2)  # allow udev to re-enumerate before probe-rs runs
+          PY
 
       - name: Run Radio Tests
         if: steps.guard.outputs.skip != 'true'
